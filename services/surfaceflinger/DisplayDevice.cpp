@@ -23,6 +23,7 @@
 
 #include <utils/RefBase.h>
 #include <utils/Log.h>
+#include <cutils/properties.h>
 
 #include <ui/DisplayInfo.h>
 #include <ui/PixelFormat.h>
@@ -43,6 +44,29 @@
 // ----------------------------------------------------------------------------
 using namespace android;
 // ----------------------------------------------------------------------------
+
+//when we use a vertical panel, but the told android to use it as a horizontal panel
+int android::getDisplayHwRotation(int display_type){
+    char value[PROPERTY_VALUE_MAX] = {0};
+    if (display_type == DisplayDevice::DISPLAY_PRIMARY) {
+        property_get("ro.sf.hwrotation", value, "0");
+    } else if (display_type == DisplayDevice::DISPLAY_EXTERNAL) {
+        property_get("ro.sf.hwrotation.external", value, "0");
+    }
+    int rotation = atoi(value);
+    return rotation;
+}
+
+
+//when we use a vertical panel, but the told android to use it as a horizontal panel
+int android::getDisplayWH(int *w, int *h){
+    char valuep[PROPERTY_VALUE_MAX];
+    property_get("const.window.w", valuep, "0") ;
+    *w = atoi(valuep);
+    property_get("const.window.h", valuep, "0") ;
+    *h = atoi(valuep);
+    return 1;
+}
 
 /*
  * Initialize the display to the specified values.
@@ -74,8 +98,11 @@ DisplayDevice::DisplayDevice(
       mLayerStack(NO_LAYER_STACK),
       mOrientation(),
       mPowerMode(HWC_POWER_MODE_OFF),
-      mActiveConfig(0)
+      mActiveConfig(0),
+      mScreenRotation(0)
 {
+    mScreenRotation = getDisplayHwRotation(type);
+
     mNativeWindow = new Surface(producer, false);
     ANativeWindow* const window = mNativeWindow.get();
 
@@ -90,8 +117,17 @@ DisplayDevice::DisplayDevice(
         config = RenderEngine::chooseEglConfig(display, format);
     }
     surface = eglCreateWindowSurface(display, config, window, NULL);
-    eglQuerySurface(display, surface, EGL_WIDTH,  &mDisplayWidth);
-    eglQuerySurface(display, surface, EGL_HEIGHT, &mDisplayHeight);
+    eglQuerySurface(display, surface, EGL_WIDTH,  &mFBWidth);
+    eglQuerySurface(display, surface, EGL_HEIGHT, &mFBHeight);
+
+
+    //get visible display size
+    getDisplayWH(&mDisplayWidth, &mDisplayHeight);
+    if (mDisplayWidth == 0 || mDisplayHeight == 0
+            || mType == DisplayDevice::DISPLAY_VIRTUAL) {
+        mDisplayWidth = mFBWidth;
+        mDisplayHeight = mFBHeight;
+    }
 
     // Make sure that composition can never be stalled by a virtual display
     // consumer that isn't processing buffers fast enough. We have to do this
@@ -285,13 +321,31 @@ EGLBoolean DisplayDevice::makeCurrent(EGLDisplay dpy, EGLContext ctx) const {
 }
 
 void DisplayDevice::setViewportAndProjection() const {
-    size_t w = mDisplayWidth;
-    size_t h = mDisplayHeight;
+    int w,h,x,y;
+
+    if (mFullViewPort && mFBWidth) {
+        //should with valid FB size
+        x = 0;
+        y = 0;
+        w = mFBWidth;
+        h = mFBHeight;
+    } else {
+        //show at the top-left corn
+        x = 0;
+        y = mFBHeight - mDisplayHeight;
+        w = mDisplayWidth;
+        h = mDisplayHeight;
+    }
     Rect sourceCrop(0, 0, w, h);
-    mFlinger->getRenderEngine().setViewportAndProjection(w, h, sourceCrop, h,
-        false, Transform::ROT_0);
+
+    mFlinger->getRenderEngine().setViewportAndProjectionWithOffset(x, y, w, h, sourceCrop, h,
+                false, Transform::ROT_0);
 }
 
+void DisplayDevice::useFullViewPort(bool bUseFullViewPort) const {
+    mFullViewPort = bUseFullViewPort;
+    setViewportAndProjection();
+}
 // ----------------------------------------------------------------------------
 
 void DisplayDevice::setVisibleLayersSortedByZ(const Vector< sp<Layer> >& layers) {
@@ -430,6 +484,7 @@ void DisplayDevice::setProjection(int orientation,
     const int h = mDisplayHeight;
 
     Transform R;
+    orientation = (orientation+(mScreenRotation/90))%4;
     DisplayDevice::orientationToTransfrom(orientation, w, h, &R);
 
     if (!frame.isValid()) {
@@ -494,13 +549,13 @@ void DisplayDevice::dump(String8& result) const {
     const Transform& tr(mGlobalTransform);
     result.appendFormat(
         "+ DisplayDevice: %s\n"
-        "   type=%x, hwcId=%d, layerStack=%u, (%4dx%4d), ANativeWindow=%p, orient=%2d (type=%08x), "
+        "   type=%x, hwcId=%d, layerStack=%u, (%4dx%4d), ANativeWindow=%p, screenorientation = %d, orient=%2d (type=%08x), "
         "flips=%u, isSecure=%d, secureVis=%d, powerMode=%d, activeConfig=%d, numLayers=%zu\n"
         "   v:[%d,%d,%d,%d], f:[%d,%d,%d,%d], s:[%d,%d,%d,%d],"
         "transform:[[%0.3f,%0.3f,%0.3f][%0.3f,%0.3f,%0.3f][%0.3f,%0.3f,%0.3f]]\n",
         mDisplayName.string(), mType, mHwcDisplayId,
         mLayerStack, mDisplayWidth, mDisplayHeight, mNativeWindow.get(),
-        mOrientation, tr.getType(), getPageFlipCount(),
+        mScreenRotation, mOrientation, tr.getType(), getPageFlipCount(),
         mIsSecure, mSecureLayerVisible, mPowerMode, mActiveConfig,
         mVisibleLayersSortedByZ.size(),
         mViewport.left, mViewport.top, mViewport.right, mViewport.bottom,

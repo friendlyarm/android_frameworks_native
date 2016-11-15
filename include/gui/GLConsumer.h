@@ -243,6 +243,12 @@ protected:
     virtual status_t acquireBufferLocked(BufferQueue::BufferItem *item,
         nsecs_t presentWhen);
 
+    // This method is added for NoTexture buffer update and release
+#ifdef VIDEO_WORKLOAD_CUT_DOWN
+    virtual status_t acquireNoTextureBufferLocked(BufferQueue::BufferItem *item,
+        nsecs_t presentWhen);
+#endif
+
     // releaseBufferLocked overrides the ConsumerBase method to update the
     // mEglSlots array in addition to the ConsumerBase.
     virtual status_t releaseBufferLocked(int slot,
@@ -260,6 +266,11 @@ protected:
     // then updates state to refer to the BufferItem, which must be a
     // newly-acquired buffer.
     status_t updateAndReleaseLocked(const BufferQueue::BufferItem& item);
+
+    // This method is added for NoTexture buffer update and release
+#ifdef VIDEO_WORKLOAD_CUT_DOWN
+    status_t updateAndReleaseNoTextureBufferLocked(const BufferQueue::BufferItem& item);
+#endif
 
     // Binds mTexName and the current buffer to mTexTarget.  Uses
     // mCurrentTexture if it's set, mCurrentTextureImage if not.  If the

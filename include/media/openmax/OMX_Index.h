@@ -134,7 +134,6 @@ typedef enum OMX_INDEXTYPE {
     OMX_IndexParamAudioSmv,                 /**< reference: OMX_AUDIO_PARAM_SMVTYPE */
     OMX_IndexParamAudioVorbis,              /**< reference: OMX_AUDIO_PARAM_VORBISTYPE */
     OMX_IndexParamAudioFlac,                /**< reference: OMX_AUDIO_PARAM_FLACTYPE */
-
     OMX_IndexConfigAudioMidiImmediateEvent, /**< reference: OMX_AUDIO_CONFIG_MIDIIMMEDIATEEVENTTYPE */
     OMX_IndexConfigAudioMidiControl,        /**< reference: OMX_AUDIO_CONFIG_MIDICONTROLTYPE */
     OMX_IndexConfigAudioMidiSoundBankProgram, /**< reference: OMX_AUDIO_CONFIG_MIDISOUNDBANKPROGRAMTYPE */
@@ -155,6 +154,16 @@ typedef enum OMX_INDEXTYPE {
     OMX_IndexConfigAudioEqualizer,          /**< reference: OMX_AUDIO_CONFIG_EQUALIZERTYPE */
     OMX_IndexConfigAudioReverberation,      /**< reference: OMX_AUDIO_CONFIG_REVERBERATIONTYPE */
     OMX_IndexConfigAudioChannelVolume,      /**< reference: OMX_AUDIO_CONFIG_CHANNELVOLUMETYPE */
+    OMX_IndexConfigAudioDtshdDecoderInfo,
+    OMX_IndexParamAudioTruehd,
+
+    // specific added by amlogic to enhance omx to support more audio codec format
+    OMX_IndexParamAudioAsf = 0x04400000,    /**< reference: OMX_AUDIO_PARAM_WMASTDTYPE */
+    OMX_IndexParamAudioAlac,                /**< reference: OMX_AUDIO_PARAM_ALACTYPE */
+    OMX_IndexParamAudioDtshd,               /**< reference: OMX_AUDIO_PARAM_DTSHDTYPE */
+    OMX_IndexParamAudioApe,                 /**< reference: OMX_AUDIO_PARAM_APETYPE */
+    OMX_IndexParamAudioDolbyAudio,          /**< reference: OMX_AUDIO_PARAM_DOLBYAUDIO */
+    OMX_IndexParamAudioFFmpeg,
 
     /* Image specific parameters and configurations */
     OMX_IndexImageStartUnused = 0x05000000,
@@ -194,6 +203,9 @@ typedef enum OMX_INDEXTYPE {
     OMX_IndexParamVideoSliceFMO,            /**< reference: OMX_VIDEO_PARAM_AVCSLICEFMO */
     OMX_IndexConfigVideoAVCIntraPeriod,     /**< reference: OMX_VIDEO_CONFIG_AVCINTRAPERIOD */
     OMX_IndexConfigVideoNalSize,            /**< reference: OMX_VIDEO_CONFIG_NALSIZE */
+
+    // specific added by amlogic to enhance omx to support SW RM/WMV2 video decoder */
+    OMX_IndexParamVideoInfo,                /**< reference: OMX_VIDEO_INFO */
 
     /* Image & Video common Configurations */
     OMX_IndexCommonStartUnused = 0x07000000,
@@ -257,7 +269,9 @@ typedef enum OMX_INDEXTYPE {
     OMX_IndexKhronosExtensions = 0x6F000000, /**< Reserved region for introducing Khronos Standard Extensions */
     /* Vendor specific area */
     OMX_IndexVendorStartUnused = 0x7F000000,
-    /* Vendor specific structures should be in the range of 0x7F000000
+    OMX_IndexSoftOMXEnableBuffer,           /**< used for AML h265 native render */
+    OMX_IndexSoftOMXUseBuffer,
+    /* Vendor specific structures should be in the range of 0x7F000000 
        to 0x7FFFFFFE.  This range is not broken out by vendor, so
        private indexes are not guaranteed unique and therefore should
        only be sent to the appropriate component. */

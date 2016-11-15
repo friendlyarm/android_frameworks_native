@@ -46,8 +46,15 @@
 
 #include "DisplayHardware/HWComposer.h"
 
+#ifdef VIDEO_WORKLOAD_CUT_DOWN
+#include "OmxUtil.h"
+#endif
+
 #include "RenderEngine/RenderEngine.h"
 
+#include <linux/compiler.h>
+#define likely(x)       __builtin_expect(!!(x), 1)
+#define unlikely(x)     __builtin_expect(!!(x), 0)
 #define DEBUG_RESIZE    0
 
 namespace android {
@@ -74,14 +81,23 @@ Layer::Layer(SurfaceFlinger* flinger, const sp<Client>& client,
         mCurrentOpacity(true),
         mRefreshPending(false),
         mFrameLatencyNeeded(false),
+        mIsSkip3D(false),
         mFiltering(false),
         mNeedsFiltering(false),
-        mMesh(Mesh::TRIANGLE_FAN, 4, 2, 2),
+        //mMesh(Mesh::TRIANGLE_FAN, 4, 2, 2),
+        mMesh(Mesh::TRIANGLE_FAN, 8, 2, 2),
         mSecure(false),
         mProtectedByApp(false),
         mHasSurface(false),
         mClientRef(client),
-        mPotentialCursor(false)
+        mPotentialCursor(false),
+        mIsBootAnimation(false),
+#ifdef VIDEO_WORKLOAD_CUT_DOWN
+        mOmxVideoHandle(0),
+        mOmxOverlayLayer(false),
+        mOmxFrameCount(0),
+#endif
+        mIsQuickBootAnimation(false)
 {
     mCurrentCrop.makeInvalid();
     mFlinger->getRenderEngine().genTextures(1, &mTextureName);
@@ -137,6 +153,13 @@ void Layer::onFirstRef() {
 
     const sp<const DisplayDevice> hw(mFlinger->getDefaultDisplayDevice());
     updateTransformHint(hw);
+
+    mIsBootAnimation = (0 == strcmp(mName.string(), "BootAnimation"));
+    if(mIsBootAnimation){
+         mBootAnimTr = hw->getTransform();
+    }
+
+    mIsQuickBootAnimation = (0 == strcmp(mName.string(), "qbd"));
 }
 
 Layer::~Layer() {
@@ -168,6 +191,55 @@ void Layer::onFrameAvailable(const BufferItem& item) {
     }
 
     android_atomic_inc(&mQueuedFrames);
+#ifdef VIDEO_WORKLOAD_CUT_DOWN
+    const sp<GraphicBuffer>& activeBuffer(item.mGraphicBuffer);
+    if ((activeBuffer != 0) && (activeBuffer->getUsage() & GRALLOC_USAGE_AML_OMX_OVERLAY) &&
+            (activeBuffer->getUsage() & GRALLOC_USAGE_AML_VIDEO_OVERLAY)) {
+        void* vaddr = 0;
+        activeBuffer->lock(activeBuffer->getUsage() | GRALLOC_USAGE_SW_READ_MASK, &vaddr);
+        //ALOGE("Stark: AML_VIDEO_OVERLAY come in, vaddr: %p", vaddr);
+        set_omx_pts((char*)vaddr, &mOmxVideoHandle);
+        activeBuffer->unlock();
+        mOmxOverlayLayer = true;
+        if (mOmxFrameCount <= 3) {
+            mOmxFrameCount++;
+        }
+
+        // this layer do not need update
+        // update and release buffer
+        //ALOGE("Stark: mQueuedFrames: %d", mQueuedFrames);
+        if (mOmxFrameCount > 3) {
+            do {
+                if (mQueuedFrames > 0) {
+                    //ALOGE("Stark: update buffer, mQueuedFrames: %d", mQueuedFrames);
+                    status_t updateResult =
+                        mSurfaceFlingerConsumer->updateAndReleaseNoTextureBuffer(mFlinger->mPrimaryDispSync);
+                    if (updateResult == BufferQueue::PRESENT_LATER) {
+                        // Producer doesn't want buffer to be displayed yet.  Signal a
+                        // layer update so we check again at the next opportunity.
+                        mOmxFrameCount = 0;
+                        break;
+                    }
+                    // Remove this buffer from our internal queue tracker
+                    { // Autolock scope
+                        Mutex::Autolock lock(mQueueItemLock);
+                        mQueueItems.removeAt(0);
+                    }
+                }
+            } while (android_atomic_dec(&mQueuedFrames) > 1);
+            if (mOmxFrameCount > 3) return;
+        }
+    } else {
+        mOmxOverlayLayer = false;
+        mOmxFrameCount = 0;
+    }
+
+    if (!mOmxOverlayLayer && mOmxVideoHandle != 0) {
+        closeamvideo();
+        mOmxVideoHandle  = 0;
+    }
+#endif
+
     mFlinger->signalLayerUpdate();
 }
 
@@ -722,10 +794,46 @@ void Layer::drawWithOpenGL(const sp<const DisplayDevice>& hw,
     // TODO: we probably want to generate the texture coords with the mesh
     // here we assume that we only have 4 vertices
     Mesh::VertexArray<vec2> texCoords(mMesh.getTexCoordArray<vec2>());
-    texCoords[0] = vec2(left, 1.0f - top);
-    texCoords[1] = vec2(left, 1.0f - bottom);
-    texCoords[2] = vec2(right, 1.0f - bottom);
-    texCoords[3] = vec2(right, 1.0f - top);
+
+    const SurfaceFlinger::DisplayDeviceState& disp(mFlinger->mCurrentState.displays.valueAt(0));
+    const float magicNum = 0.0001f;
+    //ALOGE("drawWithOpenGL layer mName %s, mIsSkip3D is %d",mName.string(),mIsSkip3D);
+    if (unlikely(!mIsSkip3D && disp.d3Format == REQUEST_3D_FORMAT_SIDE_BY_SIDE )) {
+        texCoords[0] = vec2(left - magicNum, 1.0f - top);
+        texCoords[1] = vec2(left - magicNum, 1.0f - bottom);
+        texCoords[2] = vec2(right - magicNum, 1.0f - bottom);
+        texCoords[3] = vec2(right - magicNum, 1.0f - top);
+        texCoords[4] = vec2(left + magicNum, 1.0f - top);
+        texCoords[5] = vec2(left + magicNum, 1.0f - bottom);
+        texCoords[6] = vec2(right + magicNum, 1.0f - bottom);
+        texCoords[7] = vec2(right + magicNum, 1.0f - top);
+        mMesh.setDrawCount(8);
+    } else if (unlikely(!mIsSkip3D && disp.d3Format == REQUEST_3D_FORMAT_TOP_BOTTOM )) {
+        if (win.bottom != s.active.h) {
+            texCoords[0] = vec2(left, 1.0f - top);
+            texCoords[1] = vec2(left, 1.0f - bottom);
+            texCoords[2] = vec2(right, 1.0f - bottom);
+            texCoords[3] = vec2(right, 1.0f - top);
+            texCoords[4] = vec2(left, 1.0f - top);
+            texCoords[5] = vec2(left, 1.0f - bottom);
+            texCoords[6] = vec2(right, 1.0f - bottom);
+            texCoords[7] = vec2(right, 1.0f - top);
+        } else {
+            texCoords[0] = vec2(left, (1.0f - top));
+            texCoords[1] = vec2(left, (1.0f - (bottom - magicNum)));
+            texCoords[2] = vec2(right, (1.0f - (bottom - magicNum)));
+            texCoords[3] = vec2(right, (1.0f - top));
+            texCoords[4] = vec2(left, (1.0f - top));
+            texCoords[5] = vec2(left, (1.0f - (bottom - magicNum)));
+            texCoords[6] = vec2(right, (1.0f - (bottom - magicNum)));
+            texCoords[7] = vec2(right, (1.0f - top));
+        }
+    } else {
+        texCoords[0] = vec2(left, 1.0f - top);
+        texCoords[1] = vec2(left, 1.0f - bottom);
+        texCoords[2] = vec2(right, 1.0f - bottom);
+        texCoords[3] = vec2(right, 1.0f - top);
+    }
 
     RenderEngine& engine(mFlinger->getRenderEngine());
     engine.setupLayerBlending(mPremultipliedAlpha, isOpaque(s), s.alpha);
@@ -773,6 +881,12 @@ bool Layer::getOpacityForFormat(uint32_t format) {
     return true;
 }
 
+
+void Layer::setSkip3d(bool skip3d)
+{
+    mIsSkip3D = skip3d;
+}
+
 // ----------------------------------------------------------------------------
 // local state
 // ----------------------------------------------------------------------------
@@ -781,9 +895,15 @@ void Layer::computeGeometry(const sp<const DisplayDevice>& hw, Mesh& mesh,
         bool useIdentityTransform) const
 {
     const Layer::State& s(getDrawingState());
-    const Transform tr(useIdentityTransform ?
-            hw->getTransform() : hw->getTransform() * s.transform);
+    //const Transform tr(useIdentityTransform ?
+    //        hw->getTransform() : hw->getTransform() * s.transform);
+    const Transform tr( useIdentityTransform ?
+            hw->getTransform() : (mIsQuickBootAnimation ?
+            s.transform : ( !mIsBootAnimation ?
+            (hw->getTransform()*s.transform) : (s.transform*((hw->getDisplayType() == DisplayDevice::DISPLAY_PRIMARY) ?
+            mBootAnimTr : hw->getTransform())))));
     const uint32_t hw_h = hw->getHeight();
+    const uint32_t hw_w = hw->getWidth();
     Rect win(s.active.w, s.active.h);
     if (!s.active.crop.isEmpty()) {
         win.intersect(s.active.crop, &win);
@@ -792,11 +912,44 @@ void Layer::computeGeometry(const sp<const DisplayDevice>& hw, Mesh& mesh,
     win = reduce(win, s.activeTransparentRegion);
 
     Mesh::VertexArray<vec2> position(mesh.getPositionArray<vec2>());
-    position[0] = tr.transform(win.left,  win.top);
-    position[1] = tr.transform(win.left,  win.bottom);
-    position[2] = tr.transform(win.right, win.bottom);
-    position[3] = tr.transform(win.right, win.top);
-    for (size_t i=0 ; i<4 ; i++) {
+    const SurfaceFlinger::DisplayDeviceState& disp(mFlinger->mCurrentState.displays.valueAt(0));
+    Rect r=hw->getViewport();
+    uint32_t tmp_width = r.width();
+    uint32_t tmp_height = r.height();
+    //uint32_t count= mesh.getVertexCount();
+
+    //ALOGE("computeGeometry layer mName %s, mIsSkip3D is %d", mName.string(), mIsSkip3D);
+    if (unlikely(!mIsSkip3D && disp.d3Format == REQUEST_3D_FORMAT_SIDE_BY_SIDE)) {
+        // left-right
+        position[0] = tr.transform(win.left/2,  win.top);
+        position[1] = tr.transform(win.left/2,  win.bottom);
+        position[2] = tr.transform(win.right/2, win.bottom);
+        position[3] = tr.transform(win.right/2, win.top);
+        position[4] = tr.transform((tmp_width+win.left)/2, win.top);
+        position[5] = tr.transform((tmp_width+win.left)/2, win.bottom);
+        position[6] = tr.transform((tmp_width+win.right)/2, win.bottom);
+        position[7] = tr.transform((tmp_width+win.right)/2, win.top);
+        mesh.setDrawCount(8);
+    } else if (unlikely(!mIsSkip3D && disp.d3Format == REQUEST_3D_FORMAT_TOP_BOTTOM)) {
+        //top-bottom,cupute the android-window axis
+        position[0] = tr.transform(win.left,  (win.top+1)/2);
+        position[1] = tr.transform(win.left,  (win.bottom+1)/2);
+        position[2] = tr.transform(win.right, (win.bottom+1)/2);
+        position[3] = tr.transform(win.right, (win.top+1)/2);
+        position[4] = tr.transform(win.left,  (tmp_height+win.top+1)/2);
+        position[5] = tr.transform(win.left,  (tmp_height+win.bottom+1)/2);
+        position[6] = tr.transform(win.right, (tmp_height+win.bottom+1)/2);
+        position[7] = tr.transform(win.right, (tmp_height+win.top+1)/2);
+        mesh.setDrawCount(8);
+    } else {
+        position[0] = tr.transform(win.left,  win.top);
+        position[1] = tr.transform(win.left,  win.bottom);
+        position[2] = tr.transform(win.right, win.bottom);
+        position[3] = tr.transform(win.right, win.top);
+        mesh.setDrawCount(4);
+    }
+
+    for (size_t i=0 ; i<mesh.getDrawCount(); i++) {
         position[i].y = hw_h - position[i].y;
     }
 }
@@ -970,6 +1123,18 @@ bool Layer::setPosition(float x, float y) {
     if (mCurrentState.transform.tx() == x && mCurrentState.transform.ty() == y)
         return false;
     mCurrentState.sequence++;
+
+    /*---Add for 3D case,the screen is divided into 2 part,so need to set the vertext in half----*/
+    const SurfaceFlinger::DisplayDeviceState& disp(mFlinger->mCurrentState.displays.valueAt(0));
+    //ALOGE("setPosition layer mName %s, mIsSkip3D is %d", mName.string(), mIsSkip3D);
+    if (unlikely(!mIsSkip3D && disp.d3Format == REQUEST_3D_FORMAT_SIDE_BY_SIDE)) {
+        x = x/(float)2.0;
+        if (false) ALOGW("Set the Vertex(%f,%f) in half!!\n ", x,  y);
+    } else if (unlikely(!mIsSkip3D && disp.d3Format == REQUEST_3D_FORMAT_TOP_BOTTOM)) {
+        y = y/(float)2.0;
+        if (false) ALOGW("Set the Vertex(%f,%f) in half!!\n ", x,  y);
+    }
+
     mCurrentState.transform.set(x, y);
     setTransactionFlags(eTransactionNeeded);
     return true;
@@ -1042,6 +1207,10 @@ bool Layer::setLayerStack(uint32_t layerStack) {
 // ----------------------------------------------------------------------------
 
 bool Layer::shouldPresentNow(const DispSync& dispSync) const {
+    if (mSidebandStreamChanged) {
+        return true;
+    }
+
     Mutex::Autolock lock(mQueueItemLock);
     nsecs_t expectedPresent =
             mSurfaceFlingerConsumer->computeExpectedPresent(dispSync);
@@ -1105,6 +1274,13 @@ Region Layer::latchBuffer(bool& recomputeVisibleRegions)
 
     Region outDirtyRegion;
     if (mQueuedFrames > 0) {
+
+#ifdef VIDEO_WORKLOAD_CUT_DOWN
+        // if this layer is omx layer overlay, we return directly
+        if (mOmxOverlayLayer && mOmxFrameCount > 3) {
+            return outDirtyRegion;
+        }
+#endif
 
         // if we've already called updateTexImage() without going through
         // a composition step, we have to skip this layer at this point

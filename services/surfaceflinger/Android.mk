@@ -92,6 +92,14 @@ endif
 LOCAL_CFLAGS += -fvisibility=hidden -Werror=format
 LOCAL_CFLAGS += -std=c++11
 
+ifeq ($(TARGET_EXTERNAL_DISPLAY),true)
+ifeq ($(TARGET_SINGLE_EXTERNAL_DISPLAY_USE_FB1),true)
+LOCAL_CFLAGS += -DSINGLE_EXTERNAL_DISPLAY_USE_FB1
+endif
+endif
+
+LOCAL_CFLAGS += -DVIDEO_WORKLOAD_CUT_DOWN
+
 LOCAL_SHARED_LIBRARIES := \
 	libcutils \
 	liblog \
@@ -105,6 +113,11 @@ LOCAL_SHARED_LIBRARIES := \
 	libui \
 	libgui \
 	libpowermanager
+
+LOCAL_STATIC_LIBRARIES := libomxutil
+OMX_UTIL_DIR := hardware/amlogic/hwcomposer/tvp
+LOCAL_C_INCLUDES += \
+    $(OMX_UTIL_DIR)
 
 LOCAL_MODULE:= libsurfaceflinger
 

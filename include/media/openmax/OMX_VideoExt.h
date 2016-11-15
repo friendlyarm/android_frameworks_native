@@ -40,6 +40,15 @@ extern "C" {
  */
 #include <OMX_Core.h>
 
+typedef enum OMX_VIDEO_CODINGEXTTYPE {
+    OMX_VIDEO_ExtCodingUnused = OMX_VIDEO_CodingKhronosExtensions,
+    OMX_VIDEO_CodingVC1,
+    OMX_VIDEO_CodingVP6,        /**< VP6 */
+    OMX_VIDEO_CodingMSMPEG4,    /**< MSMPEG4 */
+    OMX_VIDEO_CodingSorenson,  /**< Sorenson codec*/
+    OMX_VIDEO_CodingWMV3,
+} OMX_VIDEO_CODINGEXTTYPE;
+
 /** NALU Formats */
 typedef enum OMX_NALUFORMATSTYPE {
     OMX_NaluFormatStartCodes = 1,
@@ -202,6 +211,14 @@ typedef struct OMX_VIDEO_SLICESEGMENTSTYPE {
     OMX_BOOL bDepedentSegments;
     OMX_BOOL bEnableLoopFilterAcrossSlices;
 } OMX_VIDEO_SLICESEGMENTSTYPE;
+
+/** force shutdown component  when  Observer died, add by amlogic*/
+typedef struct OMX_VIDEO_FORCESHUTDOWMCOMPONENT{
+    OMX_U32 nSize;
+    OMX_VERSIONTYPE nVersion;
+    OMX_U32 nPortIndex;
+    OMX_BOOL isForceShutdowm;
+} OMX_VIDEO_FORCESHUTDOWMCOMPONENT;
 
 #ifdef __cplusplus
 }

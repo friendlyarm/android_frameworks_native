@@ -55,6 +55,10 @@ public:
     // texture.
     status_t updateTexImage(BufferRejecter* rejecter, const DispSync& dispSync);
 
+#ifdef VIDEO_WORKLOAD_CUT_DOWN
+    status_t updateAndReleaseNoTextureBuffer(const DispSync& dispSync);
+#endif
+
     // See GLConsumer::bindTextureImageLocked().
     status_t bindTextureImage();
 

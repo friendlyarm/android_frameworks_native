@@ -116,6 +116,24 @@ static const int64_t vsyncPhaseOffsetNs = VSYNC_EVENT_PHASE_OFFSET_NS;
 static const int64_t sfVsyncPhaseOffsetNs = SF_VSYNC_EVENT_PHASE_OFFSET_NS;
 
 // ---------------------------------------------------------------------------
+#define SYSFS_FB0_BLANK       "/sys/class/graphics/fb0/blank"
+#define SYSFS_PPMGR_SCALE  "/sys/class/ppmgr/ppscaler"
+#define SYSFS_PPMGR_SCALE_RECT "/sys/class/ppmgr/ppscaler_rect"
+#define SYSFS_FB0_FREESCALE      "/sys/class/graphics/fb0/free_scale"
+#define SYSFS_FB0_SCALE_AXIS   "/sys/class/graphics/fb0/scale_axis"
+#define SYSFS_FB0_SCALE        "/sys/class/graphics/fb0/scale"
+#define SYSFS_FB1_SCALE     "/sys/class/graphics/fb1/scale"
+#define SYSFS_FB1_SCALE_AXIS  "/sys/class/graphics/fb1/scale_axis"
+#define SYSFS_VIDEO_AXIS     "/sys/class/video/axis"
+#define SYSFS_DISPLAY_AXIS   "/sys/class/display/axis"
+#define SYSFS_VIDEOLAYERSTATE "/sys/class/video/video_layer1_state"
+
+#define SYSCMD_BUFSIZE   32
+
+int amsysfs_set_sysfs_str(const char *path, const char *val);
+int amsysfs_get_sysfs_str(const char *path, char *valstr, int size);
+int amsysfs_get_sysfs_int(const char *path);
+int wait_video_unreg();
 
 const String16 sHardwareTest("android.permission.HARDWARE_TEST");
 const String16 sAccessSurfaceFlinger("android.permission.ACCESS_SURFACE_FLINGER");
@@ -148,9 +166,16 @@ SurfaceFlinger::SurfaceFlinger()
         mPrimaryHWVsyncEnabled(false),
         mHWVsyncAvailable(false),
         mDaltonize(false),
-        mHasColorMatrix(false)
+        mHasColorMatrix(false),
+        mNeed2XScale(false),
+        mFormat(REQUEST_DISPLAY_FORMAT_MAX),
+        mLastFormat(REQUEST_DISPLAY_FORMAT_MAX),
+        mLastNeed2xscale(false)
 {
     ALOGI("SurfaceFlinger is starting");
+
+    //disable dump fps;
+    mEnableFps = false;
 
     // debugging stuff...
     char value[PROPERTY_VALUE_MAX];
@@ -171,6 +196,7 @@ SurfaceFlinger::SurfaceFlinger()
     }
     ALOGI_IF(mDebugRegion, "showupdates enabled");
     ALOGI_IF(mDebugDDMS, "DDMS debugging enabled");
+
 }
 
 void SurfaceFlinger::onFirstRef()
@@ -230,6 +256,9 @@ sp<IBinder> SurfaceFlinger::createDisplay(const String8& displayName,
     DisplayDeviceState info(DisplayDevice::DISPLAY_VIRTUAL);
     info.displayName = displayName;
     info.isSecure = secure;
+    info.vHeight = 0;
+    info.vWidth = 0;
+    info.d3Format=0;
     mCurrentState.displays.add(token, info);
 
     return token;
@@ -261,6 +290,9 @@ void SurfaceFlinger::createBuiltinDisplayLocked(DisplayDevice::DisplayType type)
     DisplayDeviceState info(type);
     // All non-virtual displays are currently considered secure.
     info.isSecure = true;
+    info.d3Format = 0;
+    info.vHeight=0;
+    info.vWidth = 0;
     mCurrentState.displays.add(mBuiltinDisplays[type], info);
 }
 
@@ -431,6 +463,20 @@ void SurfaceFlinger::init() {
                     type, hwcId, mHwc->getFormat(hwcId), isSecure, token,
                     fbs, producer,
                     mRenderEngine->getEGLConfig());
+            if (type == DisplayDevice::DISPLAY_EXTERNAL) {
+                size_t j;
+                for (j=0 ; j<mDisplays.size() ; j++) {
+                    if (mDisplays[j]->getDisplayType() == HWC_DISPLAY_PRIMARY) {
+                        const sp<DisplayDevice>& dpy(mDisplays[j]);
+                        int rotation=getDisplayHwRotation(type);
+                        if (rotation == 90 || rotation == 270) {
+                             hw->setProjection(DisplayState::eOrientationDefault, Rect(dpy->getWidth(), dpy->getHeight()),Rect(hw->getHeight(),hw->getWidth()));
+                        }else{
+                             hw->setProjection(DisplayState::eOrientationDefault, Rect(dpy->getWidth(), dpy->getHeight()),Rect(hw->getWidth(),hw->getHeight()));
+                        }
+                    }
+                }
+            }
             if (i > DisplayDevice::DISPLAY_PRIMARY) {
                 // FIXME: currently we don't get blank/unblank requests
                 // for displays other than the main display, so we always
@@ -576,8 +622,17 @@ status_t SurfaceFlinger::getDisplayConfigs(const sp<IBinder>& display,
             info.orientation = 0;
         }
 
-        info.w = hwConfig.width;
-        info.h = hwConfig.height;
+        getDisplayWH((int*)&(info.w),(int*)&(info.h));
+        if (info.w == 0 || info.h == 0) {
+            info.w = hwConfig.width;
+            info.h = hwConfig.height;
+        }
+
+        int rotation = getDisplayHwRotation(type);
+        if (rotation == 90 || rotation == 270) {
+            swap(info.w,info.h);
+        }
+
         info.xdpi = xdpi;
         info.ydpi = ydpi;
         info.fps = float(1e9 / hwConfig.refresh);
@@ -884,6 +939,9 @@ void SurfaceFlinger::doDebugFlashRegions()
 
     const bool repaintEverything = mRepaintEverything;
     for (size_t dpy=0 ; dpy<mDisplays.size() ; dpy++) {
+        if (skipPrimaryDisplay(dpy)) {
+            continue;
+        }
         const sp<DisplayDevice>& hw(mDisplays[dpy]);
         if (hw->isDisplayOn()) {
             // transform the dirty region into this screen's coordinate space
@@ -957,6 +1015,18 @@ void SurfaceFlinger::postComposition()
         }
     }
 
+    if (mEnableFps) {
+        if (presentFence->isValid()) {
+            mFpsTracker.setActualPresentFence(presentFence);
+        } else {
+            nsecs_t presentTime = hwc.getRefreshTimestamp(HWC_DISPLAY_PRIMARY);
+            mFpsTracker.setActualPresentTime(presentTime);
+        }
+
+        mFpsTracker.advanceFrame();
+        mFpsTracker.dumpIntimeFps(false);
+    }
+
     if (mAnimCompositionPending) {
         mAnimCompositionPending = false;
 
@@ -981,6 +1051,9 @@ void SurfaceFlinger::rebuildLayerStacks() {
 
         const LayerVector& layers(mDrawingState.layersSortedByZ);
         for (size_t dpy=0 ; dpy<mDisplays.size() ; dpy++) {
+            if (skipPrimaryDisplay(dpy)) {
+                continue;
+            }
             Region opaqueRegion;
             Region dirtyRegion;
             Vector< sp<Layer> > layersSortedByZ;
@@ -1015,6 +1088,9 @@ void SurfaceFlinger::rebuildLayerStacks() {
 
 void SurfaceFlinger::setUpHWComposer() {
     for (size_t dpy=0 ; dpy<mDisplays.size() ; dpy++) {
+        if (skipPrimaryDisplay(dpy)) {
+            continue;
+        }
         bool dirty = !mDisplays[dpy]->getDirtyRegion(false).isEmpty();
         bool empty = mDisplays[dpy]->getVisibleLayersSortedByZ().size() == 0;
         bool wasEmpty = !mDisplays[dpy]->lastCompositionHadVisibleLayers;
@@ -1049,6 +1125,9 @@ void SurfaceFlinger::setUpHWComposer() {
         if (CC_UNLIKELY(mHwWorkListDirty)) {
             mHwWorkListDirty = false;
             for (size_t dpy=0 ; dpy<mDisplays.size() ; dpy++) {
+                if (skipPrimaryDisplay(dpy)) {
+                    continue;
+                }
                 sp<const DisplayDevice> hw(mDisplays[dpy]);
                 const int32_t id = hw->getHwcDisplayId();
                 if (id >= 0) {
@@ -1072,6 +1151,9 @@ void SurfaceFlinger::setUpHWComposer() {
 
         // set the per-frame data
         for (size_t dpy=0 ; dpy<mDisplays.size() ; dpy++) {
+            if (skipPrimaryDisplay(dpy)) {
+                continue;
+            }
             sp<const DisplayDevice> hw(mDisplays[dpy]);
             const int32_t id = hw->getHwcDisplayId();
             if (id >= 0) {
@@ -1115,6 +1197,9 @@ void SurfaceFlinger::setUpHWComposer() {
         ALOGE_IF(err, "HWComposer::prepare failed (%s)", strerror(-err));
 
         for (size_t dpy=0 ; dpy<mDisplays.size() ; dpy++) {
+            if (skipPrimaryDisplay(dpy)) {
+                continue;
+            }
             sp<const DisplayDevice> hw(mDisplays[dpy]);
             hw->prepareFrame(hwc);
         }
@@ -1125,6 +1210,9 @@ void SurfaceFlinger::doComposition() {
     ATRACE_CALL();
     const bool repaintEverything = android_atomic_and(0, &mRepaintEverything);
     for (size_t dpy=0 ; dpy<mDisplays.size() ; dpy++) {
+        if (skipPrimaryDisplay(dpy)) {
+            continue;
+        }
         const sp<DisplayDevice>& hw(mDisplays[dpy]);
         if (hw->isDisplayOn()) {
             // transform the dirty region into this screen's coordinate space
@@ -1168,6 +1256,9 @@ void SurfaceFlinger::postFramebuffer()
     getDefaultDisplayDevice()->makeCurrent(mEGLDisplay, mEGLContext);
 
     for (size_t dpy=0 ; dpy<mDisplays.size() ; dpy++) {
+        if (skipPrimaryDisplay(dpy)) {
+            continue;
+        }
         sp<const DisplayDevice> hw(mDisplays[dpy]);
         const Vector< sp<Layer> >& currentLayers(hw->getVisibleLayersSortedByZ());
         hw->onSwapBuffersCompleted(hwc);
@@ -1440,6 +1531,9 @@ void SurfaceFlinger::handleTransactionLocked(uint32_t transactionFlags)
                 // if not, pick the only display it's on.
                 disp.clear();
                 for (size_t dpy=0 ; dpy<mDisplays.size() ; dpy++) {
+                    if (skipPrimaryDisplay(dpy)) {
+                        continue;
+                    }
                     sp<const DisplayDevice> hw(mDisplays[dpy]);
                     if (hw->getLayerStack() == currentlayerStack) {
                         if (disp == NULL) {
@@ -1464,6 +1558,22 @@ void SurfaceFlinger::handleTransactionLocked(uint32_t transactionFlags)
         }
     }
 
+    if (transactionFlags & eOtherNeeded) {
+        const DisplayDeviceState& disp(mCurrentState.displays.valueAt(0));
+        ALOGE("---eOtherNeeded changed mQuestWidth: %d mQuestHeight: %d",disp.vWidth,disp.vHeight);
+        mQuestY = disp.vY;
+        mQuestHeight = disp.vHeight;
+        mFormat = disp.vFormat;
+        if (disp.vFormat == REQUEST_DISPLAY_FORMAT_1080P || disp.vFormat == REQUEST_DISPLAY_FORMAT_1080I) {
+            mNeed2XScale = true;
+            mQuestX = disp.vX/2;
+            mQuestWidth = disp.vWidth/2;
+        }else{
+            mQuestX = disp.vX;
+            mQuestWidth = disp.vWidth;
+            mNeed2XScale = false;
+        }
+    }
 
     /*
      * Perform our own transaction if needed
@@ -1689,6 +1799,9 @@ void SurfaceFlinger::computeVisibleRegions(
 void SurfaceFlinger::invalidateLayerStack(uint32_t layerStack,
         const Region& dirty) {
     for (size_t dpy=0 ; dpy<mDisplays.size() ; dpy++) {
+        if (skipPrimaryDisplay(dpy)) {
+            continue;
+        }
         const sp<DisplayDevice>& hw(mDisplays[dpy]);
         if (hw->getLayerStack() == layerStack) {
             hw->dirtyRegion.orSelf(dirty);
@@ -1787,7 +1900,7 @@ void SurfaceFlinger::doDisplayComposition(const sp<const DisplayDevice>& hw,
     }
 
     if (CC_LIKELY(!mDaltonize && !mHasColorMatrix)) {
-        if (!doComposeSurfaces(hw, dirtyRegion)) return;
+        if (!doComposeSurfacesEx(hw, dirtyRegion)) return;
     } else {
         RenderEngine& engine(getRenderEngine());
         mat4 colorMatrix = mColorMatrix;
@@ -1804,6 +1917,171 @@ void SurfaceFlinger::doDisplayComposition(const sp<const DisplayDevice>& hw,
 
     // swap buffers (presentation)
     hw->swapBuffers(getHwComposer());
+}
+
+int wait_video_unreg()
+{
+    int ret = 0;
+    int waitcount = 0;
+    char buf[32]={0};
+    ret = amsysfs_get_sysfs_str("/sys/module/amvideo/parameters/new_frame_count", buf, 32);
+    while ((ret >= 0) && (!strstr(buf, "0"))) {
+        if (waitcount > 500) {
+            return -1;
+        }
+        waitcount++;
+        usleep(500);
+        memset(buf,0,sizeof(buf));
+        ret = amsysfs_get_sysfs_str("/sys/module/amvideo/parameters/new_frame_count", buf, 32);
+    }
+    return 0;
+}
+
+int  amsysfs_get_sysfs_str(const char *path, char *valstr, int size)
+{
+    int fd;
+    int count = 0;
+    fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+        count = read(fd, valstr, size - 1);
+        valstr[count] = '\0';
+        close(fd);
+    } else {
+        sprintf(valstr, "%s", "fail");
+        return -1;
+    };
+
+    return 0;
+}
+
+int amsysfs_set_sysfs_str(const char *path, const char *val)
+{
+    int fd;
+    int bytes;
+    fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (fd >= 0) {
+        bytes = write(fd, val, strlen(val));
+        ALOGI("amsysfs_set_sysfs_str %s= %s\n", path,val);
+        close(fd);
+        return 0;
+    } else {
+    }
+    return -1;
+}
+
+int amsysfs_get_sysfs_int(const char *path)
+{
+    int fd;
+    int val = 0;
+    char  bcmd[16];
+    fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+        read(fd, bcmd, sizeof(bcmd));
+        val = strtol(bcmd, NULL, 10);
+        close(fd);
+    } else {
+        ALOGE("amsysfs_get_sysfs_int %s, err: %s", path, strerror(errno));
+    }
+    return val;
+}
+
+bool SurfaceFlinger::getVideoLayerState(void) const{
+    char video_layer_state[32]={0};
+
+    if (amsysfs_get_sysfs_int(SYSFS_VIDEOLAYERSTATE) == 1) {
+        return true;
+    }
+
+    return false;
+}
+
+void SurfaceFlinger::setCursorRange(int src_w, int src_h, int des_w, int des_h)
+{
+    char buf[SYSCMD_BUFSIZE] = {0};
+
+    //blank fb0
+    amsysfs_set_sysfs_str(SYSFS_FB0_BLANK,"1");
+    amsysfs_set_sysfs_str(SYSFS_PPMGR_SCALE,"0");
+    amsysfs_set_sysfs_str(SYSFS_FB0_FREESCALE,"0");
+
+    //set range
+    bzero(buf, SYSCMD_BUFSIZE);
+    sprintf(buf,"%d %d %d %d", src_w, src_h, des_w, des_h);
+    amsysfs_set_sysfs_str(SYSFS_FB1_SCALE_AXIS, buf);
+    amsysfs_set_sysfs_str(SYSFS_FB1_SCALE, "0x10001");
+}
+
+void SurfaceFlinger::setDisplayAxis(int offset_x, int offset_y, int w, int h)
+{
+    char disp_axis[80] = {0};
+
+    sprintf(disp_axis,"%d %d %d %d %d %d 18 18", offset_x, offset_y, w, h, offset_x, offset_y);
+    amsysfs_set_sysfs_str(SYSFS_DISPLAY_AXIS, disp_axis);
+}
+
+bool SurfaceFlinger::doComposeSurfacesEx(const sp<const DisplayDevice>& hw, const Region& dirtyRegion)
+{
+    bool formatChanged = false;
+
+    if (CC_UNLIKELY(mFormat != mLastFormat)) formatChanged = true;
+    if (CC_LIKELY(mFormat == REQUEST_DISPLAY_FORMAT_MAX || mFormat == REQUEST_DISPLAY_FORMAT_720I)) {
+        if (formatChanged) {
+            if (wait_video_unreg() >= 0) {
+                char ppscaler_rect[80] = {0};
+                char video_axis[SYSCMD_BUFSIZE] = {0};
+                int x,y,w,h;
+                amsysfs_get_sysfs_str(SYSFS_PPMGR_SCALE_RECT, ppscaler_rect, sizeof(ppscaler_rect));
+                if (sscanf(ppscaler_rect, "ppscaler rect:\nx:%d,y:%d,w:%d,h:%d", &x, &y, &w, &h) == 4) {
+                    snprintf(video_axis, SYSCMD_BUFSIZE, "%d %d %d %d", x, y,  x+w-2,  y+h-2);
+                    amsysfs_set_sysfs_str(SYSFS_VIDEO_AXIS, video_axis);
+                }
+                amsysfs_set_sysfs_str(SYSFS_FB0_BLANK,"1");
+                amsysfs_set_sysfs_str(SYSFS_FB0_SCALE,"0x0");
+                amsysfs_set_sysfs_str(SYSFS_PPMGR_SCALE,"1");
+                amsysfs_set_sysfs_str(SYSFS_FB0_FREESCALE,"1");
+                amsysfs_set_sysfs_str(SYSFS_FB1_SCALE, "0");
+                amsysfs_set_sysfs_str(SYSFS_DISPLAY_AXIS,"0 0 1280 720 0 0 18 18");
+             }
+        }
+        if (!doComposeSurfaces(hw, dirtyRegion)) return false;
+    }else{
+        if (formatChanged) {
+            int x, width;
+            if (mNeed2XScale && !mLastNeed2xscale ) {
+                x = mQuestX*2;
+                width = mQuestWidth*2;
+            }else{
+                x = mQuestX;
+                width = mQuestWidth;
+            }
+            setCursorRange(hw->getWidth(), hw->getHeight(), width, mQuestHeight);
+            setDisplayAxis(x, mQuestY, hw->getWidth(), hw->getHeight());
+        }
+        RenderEngine& engine(getRenderEngine());
+        hw->useFullViewPort(true);
+        engine.beginGroupScale(hw->getWidth(),hw->getHeight(),mDaltonizer());
+        if (!doComposeSurfaces(hw, dirtyRegion)) return false;
+        engine.endGroupScale(mQuestWidth, mQuestHeight);
+        hw->useFullViewPort(false);
+        if (mNeed2XScale && !mLastNeed2xscale) {
+            char buf[SYSCMD_BUFSIZE] = {0};
+            bzero(buf, SYSCMD_BUFSIZE);
+            //need change
+            snprintf(buf, SYSCMD_BUFSIZE, "%d %d %d %d", 0, 0,  mQuestWidth-mQuestX-1,  mQuestHeight);
+            amsysfs_set_sysfs_str(SYSFS_FB0_SCALE_AXIS, buf);
+            amsysfs_set_sysfs_str(SYSFS_FB0_SCALE,"0x10000");
+        }else if (!mNeed2XScale && mLastNeed2xscale) {
+            amsysfs_set_sysfs_str(SYSFS_FB0_SCALE,"0x0");
+            amsysfs_set_sysfs_str(SYSFS_FB0_SCALE,"0x10000");
+        }
+    }
+    if (formatChanged) {
+        unblankSignalRefresh();
+        mLastFormat = mFormat;
+    }
+    mLastNeed2xscale = mNeed2XScale;
+
+    return true;
 }
 
 bool SurfaceFlinger::doComposeSurfaces(const sp<const DisplayDevice>& hw, const Region& dirty)
@@ -1834,7 +2112,11 @@ bool SurfaceFlinger::doComposeSurfaces(const sp<const DisplayDevice>& hw, const 
             // remove where there are opaque FB layers. however, on some
             // GPUs doing a "clean slate" clear might be more efficient.
             // We'll revisit later if needed.
-            engine.clearWithColor(0, 0, 0, 0);
+            if (getVideoLayerState() || hwc.hasHwcVideoComposition(id)) {
+                engine.clearWithColor(0, 0, 0, 0);
+            } else {
+                engine.clearWithColor(0, 0, 0, 1);
+            }
         } else {
             // we start with the whole screen area
             const Region bounds(hw->getBounds());
@@ -1904,6 +2186,10 @@ bool SurfaceFlinger::doComposeSurfaces(const sp<const DisplayDevice>& hw, const 
                         break;
                     }
                     case HWC_FRAMEBUFFER: {
+                        if (cur->getHints() & HWC_HINT_OSD_VIDEO_OMX) {
+                           ALOGD("Hint osd video omx, need skip 3d,layer name is %s", layer->getName().string());
+                           layer->setSkip3d(true);
+                        }
                         layer->draw(hw, clip);
                         break;
                     }
@@ -1937,7 +2223,14 @@ bool SurfaceFlinger::doComposeSurfaces(const sp<const DisplayDevice>& hw, const 
 void SurfaceFlinger::drawWormhole(const sp<const DisplayDevice>& hw, const Region& region) const {
     const int32_t height = hw->getHeight();
     RenderEngine& engine(getRenderEngine());
-    engine.fillRegionWithColor(region, height, 0, 0, 0, 0);
+
+    if (getVideoLayerState()) {
+        //ALOGE("drawWormhole: clear with 0x00");
+        engine.fillRegionWithColor(region, height, 0, 0, 0, 0);
+    } else {
+        //ALOGE("drawWormhole: clear with 0xff");
+        engine.fillRegionWithColor(region, height, 0, 0, 0, 1);
+    }
 }
 
 void SurfaceFlinger::addClientLayer(const sp<Client>& client,
@@ -2060,6 +2353,30 @@ void SurfaceFlinger::setTransactionState(
     }
 }
 
+uint32_t SurfaceFlinger::getDisplayFormatInfo(uint32_t format , uint32_t type){
+    char value[PROPERTY_VALUE_MAX]={0};
+    char prop[PROPERTY_VALUE_MAX]={0};
+    static const char *table[8][5]={
+        {"1080p","0","0","1920","1080"},
+        {"1080i","0","0","1920","1080"},
+        {"720p","0","0","1280","720"},
+        {"720i","0","0","1280","720"},
+        {"576p","0","0","720","576"},
+        {"576i","0","0","720","576"},
+        {"480p","0","0","720","480"},
+        {"480i","0","0","720","480"}
+    };
+
+    static const char *tp[4] = {"x","y","width","height"};
+
+    snprintf(prop,PROPERTY_VALUE_MAX,"ubootenv.var.%soutput%s",table[format][0],tp[type]);
+    ALOGD("getDisplayFormatInfo  prop: %s ",prop);
+    property_get(prop, value, table[format][type+1]);
+    ALOGD("getDisplayFormatInfo  defaultValue : %s ",table[format][type+1]);
+    return atoi(value);
+}
+
+
 uint32_t SurfaceFlinger::setDisplayStateLocked(const DisplayState& s)
 {
     ssize_t dpyIdx = mCurrentState.displays.indexOfKey(s.token);
@@ -2104,6 +2421,26 @@ uint32_t SurfaceFlinger::setDisplayStateLocked(const DisplayState& s)
             if (disp.height != s.height) {
                 disp.height = s.height;
                 flags |= eDisplayTransactionNeeded;
+            }
+        }
+        if (what & DisplayState::eVDisplaySizeChanged) {
+            if (disp.vFormat != s.vFormat) {
+                ALOGD("---eVDisplaySizeChanged changed [dpyIdx:%zd] vFormat: %d", dpyIdx, s.vFormat);
+                disp.vX = getDisplayFormatInfo(s.vFormat,DISPLAY_X);
+                disp.vY = getDisplayFormatInfo(s.vFormat,DISPLAY_Y);
+                disp.vWidth = getDisplayFormatInfo(s.vFormat,DISPLAY_WIDTH);
+                disp.vHeight = getDisplayFormatInfo(s.vFormat,DISPLAY_HEIGHT);
+                ALOGD("---eVDisplaySizeChanged changed [x:%u y:%u w:%u h:%u] ",disp.vX,disp.vY,disp.vWidth,disp.vHeight);
+                disp.vFormat = s.vFormat;
+                flags |= eOtherNeeded;
+            }
+        }
+
+        if (what & DisplayState::eWant3D) {
+            if (disp.d3Format != s.want3D) {
+                ALOGD("-----d3Format  changed --format %u- ",s.want3D);
+                disp.d3Format = s.want3D;
+                //flags |= eWant3DNeeded;
             }
         }
     }
@@ -2285,22 +2622,31 @@ void SurfaceFlinger::onInitializeDisplays() {
     Vector<ComposerState> state;
     Vector<DisplayState> displays;
     DisplayState d;
-    d.what = DisplayState::eDisplayProjectionChanged |
+    for (size_t dpy=0 ; dpy<mDisplays.size() ; dpy++) {
+        if (skipPrimaryDisplay(dpy)) {
+            continue;
+        }
+        //ALOGE("onInitializeDisplays type : (%d)", dpy);
+        d.what = DisplayState::eDisplayProjectionChanged |
              DisplayState::eLayerStackChanged;
-    d.token = mBuiltinDisplays[DisplayDevice::DISPLAY_PRIMARY];
-    d.layerStack = 0;
-    d.orientation = DisplayState::eOrientationDefault;
-    d.frame.makeInvalid();
-    d.viewport.makeInvalid();
-    d.width = 0;
-    d.height = 0;
-    displays.add(d);
+        d.token = mBuiltinDisplays[dpy];
+        d.layerStack = 0;
+        d.orientation = DisplayState::eOrientationDefault;
+        d.frame.makeInvalid();
+        d.viewport.makeInvalid();
+        d.width = 0;
+        d.height = 0;
+        d.vFormat = REQUEST_DISPLAY_FORMAT_MAX;
+        d.want3D=0;
+        displays.add(d);
+    }
     setTransactionState(state, displays, 0);
     setPowerModeInternal(getDisplayDevice(d.token), HWC_POWER_MODE_NORMAL);
 
     const nsecs_t period =
             getHwComposer().getRefreshPeriod(HWC_DISPLAY_PRIMARY);
     mAnimFrameTracker.setDisplayRefreshPeriod(period);
+    mFpsTracker.setDisplayRefreshPeriod(period);
 }
 
 void SurfaceFlinger::initializeDisplays() {
@@ -2316,6 +2662,21 @@ void SurfaceFlinger::initializeDisplays() {
     sp<MessageBase> msg = new MessageScreenInitialized(this);
     postMessageAsync(msg);  // we may be called from main thread, use async message
 }
+
+void SurfaceFlinger::unblankSignalRefresh() {
+    class MessageUnblankSignalRefresh : public MessageBase {
+        SurfaceFlinger* flinger;
+    public:
+        MessageUnblankSignalRefresh(SurfaceFlinger* flinger) : flinger(flinger) { }
+        virtual bool handler() {
+            amsysfs_set_sysfs_str(SYSFS_FB0_BLANK,"0");
+            return true;
+        }
+    };
+    sp<MessageBase> msg = new MessageUnblankSignalRefresh(this);
+    postMessageAsync(msg, ms2ns(500));  // use async message
+}
+
 
 void SurfaceFlinger::setPowerModeInternal(const sp<DisplayDevice>& hw,
         int mode) {
@@ -2431,6 +2792,30 @@ status_t SurfaceFlinger::dump(int fd, const Vector<String16>& args)
                     (args[index] == String16("--latency"))) {
                 index++;
                 dumpStatsLocked(args, index, result);
+                dumpAll = false;
+            }
+
+            if ((index < numArgs) &&
+                    (args[index] == String16("--fps"))) {
+                index++;
+
+                if ((index < numArgs) && (args[index] == String16("start")) ) {
+                    if (mEnableFps == false) {
+                        mEnableFps = true;
+                        mFpsTracker.clearStats();
+                    }
+                } else if ((index < numArgs) && (args[index] == String16("stop")) ) {
+                    if (mEnableFps) {
+                        mEnableFps = false;
+                        result.append("Dump tracked fps data: \n");
+                        mFpsTracker.dumpStats(result);
+                     }
+                } else {
+                    result.append("fps dump use 'dumpsys SurfaceFlinger --fps start/stop', just dump frames data now: \n ");
+                    mFpsTracker.dumpStats(result);
+                }
+
+                index++;
                 dumpAll = false;
             }
 
@@ -2617,6 +3002,9 @@ void SurfaceFlinger::dumpAllLocked(const Vector<String16>& args, size_t& index,
     result.appendFormat("Displays (%zu entries)\n", mDisplays.size());
     colorizer.reset(result);
     for (size_t dpy=0 ; dpy<mDisplays.size() ; dpy++) {
+        if (skipPrimaryDisplay(dpy)) {
+            continue;
+        }
         const sp<const DisplayDevice>& hw(mDisplays[dpy]);
         hw->dump(result);
     }
@@ -2696,6 +3084,9 @@ SurfaceFlinger::getLayerSortedByZForHwcDisplay(int id) {
     // Note: mStateLock is held here
     wp<IBinder> dpy;
     for (size_t i=0 ; i<mDisplays.size() ; i++) {
+        if (skipPrimaryDisplay(i)) {
+            continue;
+        }
         if (mDisplays.valueAt(i)->getHwcDisplayId() == id) {
             dpy = mDisplays.keyAt(i);
             break;

@@ -625,7 +625,13 @@ status_t BufferQueueProducer::queueBuffer(int slot,
             // When the queue is not empty, we need to look at the front buffer
             // state to see if we need to replace it
             BufferQueueCore::Fifo::iterator front(mCore->mQueue.begin());
-            if (front->mIsDroppable) {
+            // add by amlogic, only for omx video layer display,use async mode
+            uint32_t usage_omx = front->mGraphicBuffer->usage;
+            bool omx_drop = (usage_omx & GRALLOC_USAGE_AML_OMX_OVERLAY) &&
+                               (usage_omx & GRALLOC_USAGE_AML_VIDEO_OVERLAY) &&
+                               isAutoTimestamp;
+            //BQ_LOGV("usage_omx=%x, omx_drop=%d", usage_omx, omx_drop);
+            if (front->mIsDroppable || omx_drop) {
                 // If the front queued buffer is still being tracked, we first
                 // mark it as freed
                 if (mCore->stillTracking(front)) {
@@ -666,8 +672,15 @@ status_t BufferQueueProducer::queueBuffer(int slot,
 
     // Don't send the GraphicBuffer through the callback, and don't send
     // the slot number, since the consumer shouldn't need it
-    item.mGraphicBuffer.clear();
-    item.mSlot = BufferItem::INVALID_BUFFER_SLOT;
+#ifdef VIDEO_WORKLOAD_CUT_DOWN
+    if (!(item.mGraphicBuffer != 0 && (item.mGraphicBuffer->getUsage() & GRALLOC_USAGE_AML_OMX_OVERLAY) &&
+                (item.mGraphicBuffer->getUsage() & GRALLOC_USAGE_AML_VIDEO_OVERLAY))) {
+#endif
+        item.mGraphicBuffer.clear();
+        item.mSlot = BufferItem::INVALID_BUFFER_SLOT;
+#ifdef VIDEO_WORKLOAD_CUT_DOWN
+    }
+#endif
 
     // Call back without the main BufferQueue lock held, but with the callback
     // lock held so we can ensure that callbacks occur in order
